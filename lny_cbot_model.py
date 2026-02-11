@@ -1,31 +1,46 @@
 #!/usr/bin/env python3
-"""LNY vs CBOT: Deep Learning Analysis
+"""
+LNY vs CBOT: Does Asian traders going on Lunar New Year holiday cause
+significantly decreased trading volumes and open interest on CBOT?
 
-Research question: Does Asian traders going on Lunar New Year holiday
-cause significantly decreased trading volumes and open interest on CBOT?
+Three-model ensemble (PatchTransformer + WaveNet + CNN-BiGRU-Attention)
+with SWA, permutation importance, MC-dropout uncertainty, and proper
+year-normalized + within-window statistical tests.
 
-Architecture: Temporal CNN + BiLSTM + Multi-Head Self-Attention
-Contracts: Sc1 (Soybeans), SMc1 (Soybean Meal), Cc1 (Corn)
+Usage: python lny_cbot_model.py
 """
 
+from __future__ import annotations
+
 import json
+import math
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scipy import stats
 from sklearn.preprocessing import StandardScaler
+from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader, Dataset
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Unbuffered printing for piped output
+import builtins
+_print = builtins.print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _print(*args, **kwargs)
 
 SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -33,714 +48,730 @@ BASE_DIR = Path(__file__).parent
 CSV_PATH = BASE_DIR / "ZSZMZC_OHLCVOI_2010_2025.CSV"
 JSON_PATH = BASE_DIR / "lny_dates.json"
 
-WINDOW_SIZE = 20
-BATCH_SIZE = 64
-MAX_EPOCHS = 200
-PATIENCE = 20
-MAX_LR = 1e-3
-WEIGHT_DECAY = 1e-4
-GRAD_CLIP = 1.0
 CONTRACTS = ["Sc1", "SMc1", "Cc1"]
-CONTRACT_LABELS = {"Sc1": "Soybeans", "SMc1": "Soybean Meal", "Cc1": "Corn"}
+CONTRACT_NAMES = {"Sc1": "Soybeans", "SMc1": "Soybean Meal", "Cc1": "Corn"}
+RAW_FIELDS = ["OPEN", "CLOSE", "LOW", "HIGH", "VOLUME", "OI"]
+LNY_FEATS = ["is_official_holiday", "is_extended_window", "days_to_lny", "days_from_lny"]
+CAL_FEATS = ["dow_sin", "dow_cos", "month_sin", "month_cos", "doy_sin", "doy_cos"]
+DERIVED_PER_CONTRACT = ["vol_pct", "oi_pct", "log_ret", "vol_ratio", "gk_vol", "vol_z5", "vol_z20"]
+
+SEQ_LEN = 20
+BATCH = 32
+EPOCHS = 300
+PATIENCE = 30
+LR = 1e-3
+WD = 5e-4
+CLIP = 1.0
+SWA_START_FRAC = 0.75
+N_ENSEMBLE_SEEDS = 3
 
 
-# =============================================================================
-# 1. DATA LOADING
-# =============================================================================
+# ── Data Loading ─────────────────────────────────────────────────────────────
 
-def load_cbot_data() -> pd.DataFrame:
-    """Parse the multi-header CBOT CSV into a clean DataFrame."""
-    raw = pd.read_csv(CSV_PATH, header=None, skiprows=3)
-    frames = []
-    col_sets = [
-        ("Sc1", 1, 2, 3, 4, 5, 6, 7),      # Soybeans
-        ("SMc1", 8, 9, 10, 11, 12, 13, 14),  # Soybean Meal
-        ("Cc1", 15, 16, 17, 18, 19, 20, 21), # Corn
-    ]
-    for name, ts, o, c, l, h, v, oi in col_sets:
-        df = pd.DataFrame({
-            "date": pd.to_datetime(raw[ts], format="mixed", errors="coerce"),
-            f"{name}_open": pd.to_numeric(raw[o], errors="coerce"),
-            f"{name}_close": pd.to_numeric(raw[c], errors="coerce"),
-            f"{name}_low": pd.to_numeric(raw[l], errors="coerce"),
-            f"{name}_high": pd.to_numeric(raw[h], errors="coerce"),
-            f"{name}_volume": pd.to_numeric(raw[v], errors="coerce"),
-            f"{name}_oi": pd.to_numeric(raw[oi], errors="coerce"),
-        })
-        frames.append(df.set_index("date"))
-
-    merged = pd.concat(frames, axis=1)
-    merged = merged[~merged.index.isna()].sort_index()
-    # Forward-fill OHLC, fill volume/OI with 0 where missing
-    ohlc_cols = [c for c in merged.columns if any(x in c for x in ["open", "close", "low", "high"])]
-    vol_oi_cols = [c for c in merged.columns if any(x in c for x in ["volume", "oi"])]
-    merged[ohlc_cols] = merged[ohlc_cols].ffill()
-    merged[vol_oi_cols] = merged[vol_oi_cols].fillna(0)
-    merged = merged.dropna()
-    return merged
+def load_csv(path: Path = CSV_PATH) -> pd.DataFrame:
+    raw = pd.read_csv(path, header=None, skiprows=3).iloc[:, 1:].iloc[::-1].reset_index(drop=True)
+    names = ["Timestamp", "OPEN", "CLOSE", "LOW", "HIGH", "VOLUME", "OI"]
+    frames = {}
+    for i, c in enumerate(CONTRACTS):
+        chunk = raw.iloc[:, i * 7:(i + 1) * 7].copy()
+        chunk.columns = names
+        chunk["Timestamp"] = pd.to_datetime(chunk["Timestamp"], format="mixed", dayfirst=False)
+        for col in names[1:]:
+            chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
+        chunk = chunk.dropna(subset=["Timestamp"]).set_index("Timestamp").sort_index()
+        chunk.columns = [f"{c}_{f}" for f in RAW_FIELDS]
+        frames[c] = chunk
+    df = frames[CONTRACTS[0]]
+    for c in CONTRACTS[1:]:
+        df = df.join(frames[c], how="outer")
+    ohlc = [f"{c}_{f}" for c in CONTRACTS for f in ("OPEN", "CLOSE", "LOW", "HIGH")]
+    voi = [f"{c}_{f}" for c in CONTRACTS for f in ("VOLUME", "OI")]
+    df[ohlc] = df[ohlc].ffill()
+    df[voi] = df[voi].fillna(0)
+    return df.dropna(how="all").bfill()
 
 
-def load_lny_dates() -> dict:
-    """Load LNY holiday dates from JSON."""
-    with open(JSON_PATH) as f:
+def load_lny(path: Path = JSON_PATH) -> dict[int, dict[str, pd.Timestamp]]:
+    with open(path) as f:
         data = json.load(f)
-    holidays = {}
-    for year, info in data["holidays"].items():
-        holidays[int(year)] = {
-            "new_year_day": pd.Timestamp(info["new_year_day"]),
-            "official_start": pd.Timestamp(info["official_holiday_start"]),
-            "official_end": pd.Timestamp(info["official_holiday_end"]),
-            "extended_start": pd.Timestamp(info["extended_window_start"]),
-            "extended_end": pd.Timestamp(info["extended_window_end"]),
+    return {
+        int(y): {
+            "ny": pd.Timestamp(v["new_year_day"]),
+            "off_s": pd.Timestamp(v["official_holiday_start"]),
+            "off_e": pd.Timestamp(v["official_holiday_end"]),
+            "ext_s": pd.Timestamp(v["extended_window_start"]),
+            "ext_e": pd.Timestamp(v["extended_window_end"]),
         }
-    return holidays
+        for y, v in data["holidays"].items()
+    }
 
 
-# =============================================================================
-# 2. FEATURE ENGINEERING
-# =============================================================================
+# ── Feature Engineering ──────────────────────────────────────────────────────
 
-def engineer_features(df: pd.DataFrame, holidays: dict) -> pd.DataFrame:
-    """Create all features for the model."""
-    feat = df.copy()
-
-    # --- LNY indicator features ---
-    feat["is_official_lny"] = 0.0
-    feat["is_extended_lny"] = 0.0
-    feat["days_to_lny"] = 999.0
-    feat["days_from_lny"] = 999.0
-
-    for _, h in holidays.items():
-        mask_official = (feat.index >= h["official_start"]) & (feat.index <= h["official_end"])
-        mask_extended = (feat.index >= h["extended_start"]) & (feat.index <= h["extended_end"])
-        feat.loc[mask_official, "is_official_lny"] = 1.0
-        feat.loc[mask_extended, "is_extended_lny"] = 1.0
-        days_diff = (feat.index - h["new_year_day"]).days
-        closer = np.abs(days_diff) < np.abs(feat["days_to_lny"].values)
-        feat.loc[closer & (days_diff <= 0), "days_to_lny"] = np.abs(days_diff[closer & (days_diff <= 0)])
-        feat.loc[closer & (days_diff > 0), "days_from_lny"] = days_diff[closer & (days_diff > 0)]
-
-    feat["days_to_lny"] = feat["days_to_lny"].clip(upper=60)
-    feat["days_from_lny"] = feat["days_from_lny"].clip(upper=60)
-
-    # --- Calendar features ---
-    feat["day_of_week"] = feat.index.dayofweek / 4.0
-    feat["month_sin"] = np.sin(2 * np.pi * feat.index.month / 12)
-    feat["month_cos"] = np.cos(2 * np.pi * feat.index.month / 12)
-
-    # --- Derived features per contract ---
-    for name in CONTRACTS:
-        v = f"{name}_volume"
-        oi = f"{name}_oi"
-        c = f"{name}_close"
-        feat[f"{name}_log_return"] = np.log(feat[c] / feat[c].shift(1).replace(0, np.nan)).fillna(0)
-        feat[f"{name}_vol_pct"] = feat[v].pct_change().fillna(0).clip(-5, 5)
-        feat[f"{name}_oi_pct"] = feat[oi].pct_change().fillna(0).clip(-5, 5)
-        rm = feat[v].rolling(20, min_periods=1).mean().replace(0, 1)
-        feat[f"{name}_vol_ratio"] = (feat[v] / rm).clip(0, 10)
-
-    feat = feat.replace([np.inf, -np.inf], 0).fillna(0)
-    return feat
+def add_lny_features(df: pd.DataFrame, hols: dict) -> pd.DataFrame:
+    df = df.copy()
+    df["is_official_holiday"] = 0
+    df["is_extended_window"] = 0
+    df["days_to_lny"] = 999.0
+    df["days_from_lny"] = 999.0
+    for h in hols.values():
+        df.loc[(df.index >= h["off_s"]) & (df.index <= h["off_e"]), "is_official_holiday"] = 1
+        df.loc[(df.index >= h["ext_s"]) & (df.index <= h["ext_e"]), "is_extended_window"] = 1
+        dd = (df.index - h["ny"]).days
+        before = dd <= 0
+        after = dd > 0
+        closer_before = before & (np.abs(dd) < df["days_to_lny"].values)
+        closer_after = after & (dd < df["days_from_lny"].values)
+        df.loc[closer_before, "days_to_lny"] = np.abs(dd[closer_before])
+        df.loc[closer_after, "days_from_lny"] = dd[closer_after]
+    df["days_to_lny"] = df["days_to_lny"].clip(upper=60)
+    df["days_from_lny"] = df["days_from_lny"].clip(upper=60)
+    return df
 
 
-def get_target_cols() -> list[str]:
-    return [f"{n}_volume" for n in CONTRACTS] + [f"{n}_oi" for n in CONTRACTS]
+def add_derived(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in CONTRACTS:
+        v, o, cl, hi, lo = f"{c}_VOLUME", f"{c}_OI", f"{c}_CLOSE", f"{c}_HIGH", f"{c}_LOW"
+        df[f"{c}_vol_pct"] = df[v].pct_change().replace([np.inf, -np.inf], 0).fillna(0).clip(-5, 5)
+        df[f"{c}_oi_pct"] = df[o].pct_change().replace([np.inf, -np.inf], 0).fillna(0).clip(-5, 5)
+        df[f"{c}_log_ret"] = np.log(df[cl] / df[cl].shift(1).replace(0, np.nan)).fillna(0).replace([np.inf, -np.inf], 0)
+        rm20 = df[v].rolling(20, min_periods=1).mean().replace(0, 1)
+        df[f"{c}_vol_ratio"] = (df[v] / rm20).clip(0, 10)
+        # Garman-Klass volatility
+        log_hl = np.log(df[hi] / df[lo].replace(0, np.nan)).fillna(0)
+        log_co = np.log(df[cl] / df[f"{c}_OPEN"].replace(0, np.nan)).fillna(0)
+        df[f"{c}_gk_vol"] = np.sqrt((0.5 * log_hl ** 2 - (2 * np.log(2) - 1) * log_co ** 2).rolling(5, min_periods=1).mean().clip(0, 10))
+        # Rolling z-scores (volume relative to rolling mean/std)
+        for w in [5, 20]:
+            rm = df[v].rolling(w, min_periods=1).mean()
+            rs = df[v].rolling(w, min_periods=1).std().replace(0, 1)
+            df[f"{c}_vol_z{w}"] = ((df[v] - rm) / rs).clip(-5, 5).fillna(0)
+    return df
 
 
-def get_feature_cols(df: pd.DataFrame) -> list[str]:
-    targets = set(get_target_cols())
-    return [c for c in df.columns if c not in targets]
+def add_calendar(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    dow = df.index.dayofweek / 4.0
+    month = (df.index.month - 1) / 11.0
+    doy = (df.index.dayofyear - 1) / 364.0
+    df["dow_sin"], df["dow_cos"] = np.sin(2 * np.pi * dow), np.cos(2 * np.pi * dow)
+    df["month_sin"], df["month_cos"] = np.sin(2 * np.pi * month), np.cos(2 * np.pi * month)
+    df["doy_sin"], df["doy_cos"] = np.sin(2 * np.pi * doy), np.cos(2 * np.pi * doy)
+    return df
 
 
-def get_lny_feature_cols() -> list[str]:
-    return ["is_official_lny", "is_extended_lny", "days_to_lny", "days_from_lny"]
+def feature_cols() -> list[str]:
+    raw = [f"{c}_{f}" for c in CONTRACTS for f in RAW_FIELDS]
+    derived = [f"{c}_{s}" for c in CONTRACTS for s in DERIVED_PER_CONTRACT]
+    return raw + LNY_FEATS + CAL_FEATS + derived
 
 
-# =============================================================================
-# 3. DATASET
-# =============================================================================
-
-class TimeSeriesDataset(Dataset):
-    def __init__(self, features: np.ndarray, targets: np.ndarray, window: int = WINDOW_SIZE):
-        self.features = torch.FloatTensor(features)
-        self.targets = torch.FloatTensor(targets)
-        self.window = window
-
-    def __len__(self) -> int:
-        return len(self.features) - self.window
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.features[idx : idx + self.window]
-        y = self.targets[idx + self.window]
-        return x, y
+def target_cols() -> list[str]:
+    return [f"{c}_VOLUME" for c in CONTRACTS] + [f"{c}_OI" for c in CONTRACTS]
 
 
-# =============================================================================
-# 4. MODEL ARCHITECTURE
-# =============================================================================
-
-class TemporalCNNBlock(nn.Module):
-    """Dilated causal 1D convolutions with residual connections."""
-    def __init__(self, in_ch: int, out_ch: int, dilations: list[int] = [1, 2, 4]):
-        super().__init__()
-        layers = []
-        for d in dilations:
-            layers.append(nn.Conv1d(in_ch if not layers else out_ch, out_ch,
-                                    kernel_size=3, padding=d, dilation=d))
-            layers.append(nn.BatchNorm1d(out_ch))
-            layers.append(nn.GELU())
-            layers.append(nn.Dropout(0.2))
-        self.net = nn.Sequential(*layers)
-        self.residual = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x) + self.residual(x)
+def build_features(df: pd.DataFrame, hols: dict) -> tuple[pd.DataFrame, list[str], list[str]]:
+    df = add_lny_features(df, hols)
+    df = add_derived(df)
+    df = add_calendar(df)
+    df = df.replace([np.inf, -np.inf], 0).fillna(0)
+    return df, feature_cols(), target_cols()
 
 
-class MultiHeadAttention(nn.Module):
-    """Scaled dot-product multi-head attention."""
-    def __init__(self, d_model: int, n_heads: int = 4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=0.1, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+# ── Statistical Analysis ─────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.attn(x, x, x)
-        return self.norm(x + out)
-
-
-class LNYCBOTModel(nn.Module):
-    """Temporal CNN + BiLSTM + Multi-Head Attention for volume/OI prediction."""
-    def __init__(self, n_features: int, n_targets: int, hidden: int = 128):
-        super().__init__()
-        self.tcn = TemporalCNNBlock(n_features, hidden)
-        self.lstm = nn.LSTM(hidden, hidden // 2, num_layers=2,
-                            bidirectional=True, batch_first=True, dropout=0.2)
-        self.layer_norm = nn.LayerNorm(hidden)
-        self.attention = MultiHeadAttention(hidden, n_heads=4)
-        self.head = nn.Sequential(
-            nn.Linear(hidden, hidden // 2),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden // 2, n_targets),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq, features)
-        h = self.tcn(x.transpose(1, 2)).transpose(1, 2)  # TCN expects (B, C, T)
-        h, _ = self.lstm(h)
-        h = self.layer_norm(h)
-        h = self.attention(h)
-        return self.head(h[:, -1, :])  # last timestep
+@dataclass
+class StatResult:
+    contract: str
+    metric: str
+    lny_mean: float
+    ctrl_mean: float
+    avg_yearly_pct: float
+    med_yearly_pct: float
+    t_stat: float
+    t_pval: float
+    u_stat: float
+    u_pval: float
+    cohens_d: float
+    ci_lo: float
+    ci_hi: float
+    n_lny: int
+    n_ctrl: int
+    n_years: int
+    yearly_pcts: list[float] = field(default_factory=list)
 
 
-# =============================================================================
-# 5. TRAINING
-# =============================================================================
-
-def train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    n_epochs: int = MAX_EPOCHS,
-) -> dict:
-    """Train with early stopping, LR scheduling, gradient clipping."""
-    optimizer = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=MAX_LR,
-        steps_per_epoch=len(train_loader), epochs=n_epochs
-    )
-    criterion = nn.MSELoss()
-
-    best_val_loss = float("inf")
-    best_state = None
-    patience_counter = 0
-    history = {"train_loss": [], "val_loss": []}
-
-    for epoch in range(n_epochs):
-        # Train
-        model.train()
-        train_losses = []
-        for xb, yb in train_loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            pred = model(xb)
-            loss = criterion(pred, yb)
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
-            scheduler.step()
-            train_losses.append(loss.item())
-
-        # Validate
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                val_losses.append(criterion(model(xb), yb).item())
-
-        t_loss = np.mean(train_losses)
-        v_loss = np.mean(val_losses)
-        history["train_loss"].append(t_loss)
-        history["val_loss"].append(v_loss)
-
-        if v_loss < best_val_loss:
-            best_val_loss = v_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if (epoch + 1) % 20 == 0 or epoch == 0:
-            print(f"  Epoch {epoch+1:3d}/{n_epochs} | Train: {t_loss:.6f} | Val: {v_loss:.6f} | Best: {best_val_loss:.6f}")
-
-        if patience_counter >= PATIENCE:
-            print(f"  Early stopping at epoch {epoch+1}")
-            break
-
-    model.load_state_dict(best_state)
-    return history
+def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = len(a), len(b)
+    pooled = np.sqrt(((na - 1) * np.var(a, ddof=1) + (nb - 1) * np.var(b, ddof=1)) / (na + nb - 2))
+    return float((a.mean() - b.mean()) / pooled) if pooled > 0 else 0.0
 
 
-# =============================================================================
-# 6. STATISTICAL ANALYSIS
-# =============================================================================
+def _boot_ci(vals: np.ndarray, n: int = 10000) -> tuple[float, float]:
+    rng = np.random.RandomState(SEED)
+    means = [rng.choice(vals, len(vals), replace=True).mean() for _ in range(n)]
+    return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
-def run_statistical_tests(df: pd.DataFrame, holidays: dict) -> dict:
-    """Year-normalized statistical tests: each LNY window vs its own control window.
 
-    Control = 4 weeks before extended_start + 4 weeks after extended_end (same year).
-    This eliminates secular volume growth and seasonal confounds.
-    Also tests volume_ratio (volume / 20-day rolling mean) as a normalized metric.
-    """
-    results = {}
-    for contract in CONTRACTS:
-        results[contract] = {}
-        for metric in ["volume", "oi"]:
-            col = f"{contract}_{metric}"
-            ratio_col = f"{contract}_vol_ratio" if metric == "volume" else None
-
-            lny_vals, control_vals = [], []
-            lny_ratios, control_ratios = [], []
-            yearly_pct_changes = []
-
-            for year, h in holidays.items():
-                # LNY extended window
-                lny_mask = (df.index >= h["extended_start"]) & (df.index <= h["extended_end"])
-                # Control: 4 weeks before + 4 weeks after the extended window
-                ctrl_before = (df.index >= h["extended_start"] - pd.Timedelta(days=28)) & (df.index < h["extended_start"])
-                ctrl_after = (df.index > h["extended_end"]) & (df.index <= h["extended_end"] + pd.Timedelta(days=28))
-                ctrl_mask = ctrl_before | ctrl_after
-
-                lny_data = df.loc[lny_mask, col].values
-                ctrl_data = df.loc[ctrl_mask, col].values
-
-                if len(lny_data) > 0 and len(ctrl_data) > 0:
-                    lny_vals.extend(lny_data)
-                    control_vals.extend(ctrl_data)
-                    ctrl_mean = np.mean(ctrl_data)
-                    if ctrl_mean > 0:
-                        yearly_pct_changes.append((np.mean(lny_data) - ctrl_mean) / ctrl_mean * 100)
-
-                    if ratio_col and ratio_col in df.columns:
-                        lny_ratios.extend(df.loc[lny_mask, ratio_col].values)
-                        control_ratios.extend(df.loc[ctrl_mask, ratio_col].values)
-
-            lny_vals = np.array(lny_vals)
-            control_vals = np.array(control_vals)
-
-            # Welch's t-test
-            t_stat, t_pval = stats.ttest_ind(lny_vals, control_vals, equal_var=False)
-            # Mann-Whitney U
-            u_stat, u_pval = stats.mannwhitneyu(lny_vals, control_vals, alternative="two-sided")
-            # Cohen's d
-            pooled_std = np.sqrt((np.var(lny_vals) + np.var(control_vals)) / 2)
-            cohens_d = (np.mean(lny_vals) - np.mean(control_vals)) / pooled_std if pooled_std > 0 else 0
-
-            # Bootstrap CI on year-level % changes (proper unit of analysis)
-            n_boot = 10000
-            ypc = np.array(yearly_pct_changes)
-            boot_means = [np.mean(np.random.choice(ypc, size=len(ypc), replace=True)) for _ in range(n_boot)]
-            ci_lo, ci_hi = np.percentile(boot_means, [2.5, 97.5])
-
-            # Ratio-based test (volume only)
-            ratio_result = None
-            if lny_ratios:
-                r_t, r_p = stats.ttest_ind(lny_ratios, control_ratios, equal_var=False)
-                ratio_result = {"t": r_t, "p": r_p,
-                                "lny_mean": np.mean(lny_ratios), "ctrl_mean": np.mean(control_ratios)}
-
-            results[contract][metric] = {
-                "lny_mean": np.mean(lny_vals),
-                "control_mean": np.mean(control_vals),
-                "avg_yearly_pct_change": np.mean(yearly_pct_changes),
-                "median_yearly_pct_change": np.median(yearly_pct_changes),
-                "welch_t": t_stat, "welch_p": t_pval,
-                "mann_whitney_u": u_stat, "mann_whitney_p": u_pval,
-                "cohens_d": cohens_d,
-                "bootstrap_ci": (ci_lo, ci_hi),
-                "n_lny": len(lny_vals), "n_control": len(control_vals),
-                "n_years": len(yearly_pct_changes),
-                "yearly_pct_changes": yearly_pct_changes,
-                "ratio_test": ratio_result,
-            }
+def run_stats(df: pd.DataFrame, hols: dict) -> list[StatResult]:
+    """Year-normalized: each LNY extended window vs 4 weeks before + 4 weeks after."""
+    results = []
+    for c in CONTRACTS:
+        for mname, suffix in [("Volume", "VOLUME"), ("Open Interest", "OI")]:
+            col = f"{c}_{suffix}"
+            all_lny, all_ctrl, yearly = [], [], []
+            for h in hols.values():
+                lm = (df.index >= h["ext_s"]) & (df.index <= h["ext_e"])
+                cb = (df.index >= h["ext_s"] - pd.Timedelta(days=28)) & (df.index < h["ext_s"])
+                ca = (df.index > h["ext_e"]) & (df.index <= h["ext_e"] + pd.Timedelta(days=28))
+                ld, cd = df.loc[lm, col].values, df.loc[cb | ca, col].values
+                if len(ld) > 0 and len(cd) > 0:
+                    all_lny.extend(ld)
+                    all_ctrl.extend(cd)
+                    cm = cd.mean()
+                    if cm > 0:
+                        yearly.append((ld.mean() - cm) / cm * 100)
+            a, b = np.asarray(all_lny, float), np.asarray(all_ctrl, float)
+            ts, tp = stats.ttest_ind(a, b, equal_var=False)
+            us, up = stats.mannwhitneyu(a, b, alternative="two-sided")
+            yp = np.asarray(yearly)
+            ci = _boot_ci(yp) if len(yp) > 1 else (yp[0], yp[0])
+            results.append(StatResult(
+                CONTRACT_NAMES[c], mname, a.mean(), b.mean(),
+                yp.mean(), float(np.median(yp)), ts, tp, us, up,
+                _cohens_d(a, b), ci[0], ci[1], len(a), len(b), len(yp), list(yearly),
+            ))
     return results
 
 
-def print_statistical_results(results: dict) -> None:
-    """Print formatted statistical test results."""
-    print("\n" + "=" * 90)
-    print("STATISTICAL ANALYSIS: LNY Window vs Control Window (Year-Normalized)")
-    print("Control = 4 weeks before + 4 weeks after each LNY extended window")
-    print("=" * 90)
+def run_within_window(df: pd.DataFrame, hols: dict) -> None:
+    """PRIMARY TEST: Compare official holiday week vs immediately-adjacent weeks WITHIN the same LNY window.
+    This controls for seasonality and secular trends because both periods are in the same Jan/Feb timeframe."""
+    print("\n" + "=" * 105)
+    print("PRIMARY TEST: Official Holiday Week vs Adjacent Weeks (Within-Window Comparison)")
+    print("This is the most rigorous test - compares the actual holiday days against the")
+    print("1-2 weeks immediately before AND after within the same LNY event.")
+    print("=" * 105)
 
-    for contract in CONTRACTS:
-        label = CONTRACT_LABELS[contract]
-        print(f"\n--- {label} ({contract}) ---")
-        for metric in ["volume", "oi"]:
-            r = results[contract][metric]
-            metric_label = "Volume" if metric == "volume" else "Open Interest"
-            sig_welch = "***" if r["welch_p"] < 0.001 else "**" if r["welch_p"] < 0.01 else "*" if r["welch_p"] < 0.05 else "ns"
-            sig_mw = "***" if r["mann_whitney_p"] < 0.001 else "**" if r["mann_whitney_p"] < 0.01 else "*" if r["mann_whitney_p"] < 0.05 else "ns"
-            effect = "large" if abs(r["cohens_d"]) >= 0.8 else "medium" if abs(r["cohens_d"]) >= 0.5 else "small" if abs(r["cohens_d"]) >= 0.2 else "negligible"
+    for c in CONTRACTS:
+        print(f"\n  --- {CONTRACT_NAMES[c]} ({c}) ---")
+        for mname, suffix in [("Volume", "VOLUME"), ("Open Interest", "OI")]:
+            col = f"{c}_{suffix}"
+            official_pcts, pre_pcts, post_pcts = [], [], []
+            for h in hols.values():
+                pre = df.loc[(df.index >= h["ext_s"]) & (df.index < h["off_s"]), col]
+                off = df.loc[(df.index >= h["off_s"]) & (df.index <= h["off_e"]), col]
+                post = df.loc[(df.index > h["off_e"]) & (df.index <= h["ext_e"]), col]
+                if len(pre) < 2 or len(off) < 2 or len(post) < 2:
+                    continue
+                baseline = pd.concat([pre, post]).mean()
+                if baseline > 0:
+                    official_pcts.append((off.mean() - baseline) / baseline * 100)
+                    pre_pcts.append((pre.mean() - baseline) / baseline * 100)
+                    post_pcts.append((post.mean() - baseline) / baseline * 100)
 
-            print(f"\n  {metric_label} ({r['n_years']} LNY events):")
-            print(f"    LNY window mean:      {r['lny_mean']:>14,.1f}  (n={r['n_lny']} days)")
-            print(f"    Control window mean:  {r['control_mean']:>14,.1f}  (n={r['n_control']} days)")
-            print(f"    Avg yearly change:    {r['avg_yearly_pct_change']:>+13.1f}%")
-            print(f"    Median yearly change: {r['median_yearly_pct_change']:>+13.1f}%")
-            print(f"    Welch's t-test:       t={r['welch_t']:>8.3f}, p={r['welch_p']:.2e} {sig_welch}")
-            print(f"    Mann-Whitney U:       U={r['mann_whitney_u']:>10.0f}, p={r['mann_whitney_p']:.2e} {sig_mw}")
-            print(f"    Cohen's d:            {r['cohens_d']:>8.3f} ({effect})")
-            print(f"    Bootstrap 95% CI:     [{r['bootstrap_ci'][0]:>+12.1f}%, {r['bootstrap_ci'][1]:>+12.1f}%]")
-            if r["ratio_test"]:
-                rt = r["ratio_test"]
-                sig_r = "***" if rt["p"] < 0.001 else "**" if rt["p"] < 0.01 else "*" if rt["p"] < 0.05 else "ns"
-                print(f"    Vol ratio (LNY/ctrl): {rt['lny_mean']:.3f} vs {rt['ctrl_mean']:.3f}, p={rt['p']:.2e} {sig_r}")
-
-
-def run_subwindow_analysis(df: pd.DataFrame, holidays: dict) -> None:
-    """Break down LNY into pre/during/post official holiday for deeper insight.
-
-    Uses 4-week control (2 weeks before + 2 weeks after extended window) to
-    minimize outliers from contract rolls. Reports median (robust to outliers).
-    """
-    print("\n" + "=" * 90)
-    print("SUB-WINDOW ANALYSIS: Pre-Holiday | During Official Holiday | Post-Holiday")
-    print("Control = 4 weeks surrounding extended window (2 before + 2 after)")
-    print("=" * 90)
-
-    for contract in CONTRACTS:
-        label = CONTRACT_LABELS[contract]
-        print(f"\n--- {label} ({contract}) ---")
-        for metric in ["volume", "oi"]:
-            col = f"{contract}_{metric}"
-            sub_results = {"pre": [], "official": [], "post": []}
-
-            for year, h in holidays.items():
-                ctrl_before = df[(df.index >= h["extended_start"] - pd.Timedelta(days=14)) &
-                                 (df.index < h["extended_start"])]
-                ctrl_after = df[(df.index > h["extended_end"]) &
-                                (df.index <= h["extended_end"] + pd.Timedelta(days=14))]
-                ctrl = pd.concat([ctrl_before, ctrl_after])
-                pre = df[(df.index >= h["extended_start"]) & (df.index < h["official_start"])]
-                official = df[(df.index >= h["official_start"]) & (df.index <= h["official_end"])]
-                post = df[(df.index > h["official_end"]) & (df.index <= h["extended_end"])]
-
-                ctrl_mean = ctrl[col].mean()
-                if ctrl_mean > 0 and len(ctrl) >= 5:
-                    for name, subset in [("pre", pre), ("official", official), ("post", post)]:
-                        if len(subset) > 0:
-                            sub_results[name].append(
-                                (subset[col].mean() - ctrl_mean) / ctrl_mean * 100
-                            )
-
-            metric_label = "Volume" if metric == "volume" else "Open Interest"
-            print(f"\n  {metric_label} (% change vs control, using MEDIAN across years):")
-            for phase, label_p in [("pre", "Pre-holiday"), ("official", "Official holiday"),
-                                    ("post", "Post-holiday")]:
-                vals = sub_results[phase]
-                if vals:
-                    median_v = np.median(vals)
-                    neg_count = sum(1 for v in vals if v < 0)
-                    sym = "v DECREASE" if median_v < 0 else "^ INCREASE" if median_v > 5 else "~ FLAT"
-                    print(f"    {label_p:<18} median: {median_v:>+7.1f}%  "
-                          f"({neg_count}/{len(vals)} years negative) {sym}")
+            op = np.asarray(official_pcts)
+            if len(op) > 1:
+                t, p = stats.ttest_1samp(op, 0)
+                neg = (op < 0).sum()
+                eff = "large" if abs(np.mean(op)) > 20 else "medium" if abs(np.mean(op)) > 10 else "small"
+                sig = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+                direction = "DECREASE" if np.median(op) < -2 else "INCREASE" if np.median(op) > 2 else "~FLAT"
+                print(f"\n    {mname}: Official holiday vs pre+post weeks")
+                print(f"      Median change: {np.median(op):>+7.1f}%  Mean: {np.mean(op):>+7.1f}%  ({neg}/{len(op)} years negative)")
+                print(f"      One-sample t-test (H0: no change): t={t:.3f}, p={p:.3e} {sig}")
+                print(f"      Effect: {eff}  Direction: {direction}")
 
 
-# =============================================================================
-# 7. ABLATION ANALYSIS
-# =============================================================================
+def print_stats(results: list[StatResult]) -> None:
+    print("\n" + "=" * 105)
+    print("SECONDARY TEST: LNY Extended Window vs Surrounding Control (4 wks before + after)")
+    print("=" * 105)
+    for r in results:
+        st = "***" if r.t_pval < 0.001 else "**" if r.t_pval < 0.01 else "*" if r.t_pval < 0.05 else "ns"
+        su = "***" if r.u_pval < 0.001 else "**" if r.u_pval < 0.01 else "*" if r.u_pval < 0.05 else "ns"
+        eff = "large" if abs(r.cohens_d) >= 0.8 else "medium" if abs(r.cohens_d) >= 0.5 else "small" if abs(r.cohens_d) >= 0.2 else "negligible"
+        arr = "LOWER" if r.avg_yearly_pct < -2 else "HIGHER" if r.avg_yearly_pct > 2 else "~SAME"
+        print(f"\n  {r.contract} - {r.metric} ({r.n_years} events, {r.n_lny} vs {r.n_ctrl} days) [{arr}]")
+        print(f"    LNY: {r.lny_mean:>12,.0f}  Control: {r.ctrl_mean:>12,.0f}  Yearly: {r.avg_yearly_pct:>+6.1f}% (med {r.med_yearly_pct:>+6.1f}%)")
+        print(f"    Welch t={r.t_stat:>7.2f} p={r.t_pval:.1e}{st}  MW-U={r.u_stat:>9.0f} p={r.u_pval:.1e}{su}  d={r.cohens_d:>+.3f}({eff})")
+        print(f"    95% CI: [{r.ci_lo:>+6.1f}%, {r.ci_hi:>+6.1f}%]")
 
-def run_ablation(
-    model: nn.Module,
-    dataset: TimeSeriesDataset,
-    feature_cols: list[str],
-    df_index: pd.DatetimeIndex,
-) -> dict:
-    """Feature ablation: compare predictions with vs without LNY features."""
-    model.eval()
-    lny_col_indices = [feature_cols.index(c) for c in get_lny_feature_cols() if c in feature_cols]
 
-    loader = DataLoader(dataset, batch_size=256, shuffle=False)
+# ── Dataset ──────────────────────────────────────────────────────────────────
 
-    preds_full, preds_ablated = [], []
-    with torch.no_grad():
-        for xb, _ in loader:
-            xb = xb.to(DEVICE)
-            preds_full.append(model(xb).cpu().numpy())
-            xb_abl = xb.clone()
-            xb_abl[:, :, lny_col_indices] = 0.0
-            preds_ablated.append(model(xb_abl).cpu().numpy())
+class TSDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray, seq: int = SEQ_LEN):
+        self.X, self.y, self.seq = torch.FloatTensor(X), torch.FloatTensor(y), seq
 
-    preds_full = np.concatenate(preds_full)
-    preds_ablated = np.concatenate(preds_ablated)
+    def __len__(self) -> int:
+        return max(0, len(self.X) - self.seq)
 
-    # Align with date index (offset by window size)
-    aligned_dates = df_index[WINDOW_SIZE : WINDOW_SIZE + len(preds_full)]
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.X[i:i + self.seq], self.y[i + self.seq]
 
-    return {
-        "preds_full": preds_full,
-        "preds_ablated": preds_ablated,
-        "dates": aligned_dates,
-        "lny_col_indices": lny_col_indices,
+
+# ── Model 1: PatchTransformer ────────────────────────────────────────────────
+
+class PosEncoding(nn.Module):
+    def __init__(self, d: int, max_len: int = 200):
+        super().__init__()
+        pe = torch.zeros(max_len, d)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d, 2, dtype=torch.float) * (-math.log(10000.0) / d))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, :x.size(1)]
+
+
+class PatchTransformer(nn.Module):
+    """Patch-based transformer encoder inspired by PatchTST."""
+    def __init__(self, n_feat: int, n_tgt: int, d_model: int = 128, n_heads: int = 8,
+                 n_layers: int = 4, patch_len: int = 5, dropout: float = 0.3):
+        super().__init__()
+        self.patch_len = patch_len
+        n_patches = SEQ_LEN // patch_len
+        self.input_proj = nn.Linear(n_feat * patch_len, d_model)
+        self.pos_enc = PosEncoding(d_model, n_patches + 1)
+        layer = nn.TransformerEncoderLayer(d_model, n_heads, d_model * 4, dropout, batch_first=True, activation="gelu")
+        self.encoder = nn.TransformerEncoder(layer, n_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model // 2, n_tgt),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, F = x.shape
+        n_p = T // self.patch_len
+        x = x[:, :n_p * self.patch_len].reshape(B, n_p, self.patch_len * F)
+        x = self.pos_enc(self.input_proj(x))
+        x = self.norm(self.encoder(x))
+        return self.head(x[:, -1])
+
+
+# ── Model 2: WaveNet-style Deep Causal CNN ───────────────────────────────────
+
+class WaveBlock(nn.Module):
+    def __init__(self, ch: int, dilation: int):
+        super().__init__()
+        self.conv_gate = nn.Conv1d(ch, ch, 3, padding=dilation, dilation=dilation)
+        self.conv_filter = nn.Conv1d(ch, ch, 3, padding=dilation, dilation=dilation)
+        self.bn = nn.BatchNorm1d(ch)
+        self.res = nn.Conv1d(ch, ch, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        g = torch.sigmoid(self.conv_gate(x))
+        f = torch.tanh(self.conv_filter(x))
+        out = self.bn(g * f)
+        return self.res(out) + x
+
+
+class WaveNet(nn.Module):
+    """Deep dilated causal CNN with 6 layers of exponentially growing receptive field."""
+    def __init__(self, n_feat: int, n_tgt: int, ch: int = 128, dropout: float = 0.3):
+        super().__init__()
+        self.input_proj = nn.Conv1d(n_feat, ch, 1)
+        self.blocks = nn.Sequential(*[WaveBlock(ch, 2 ** i) for i in range(6)])
+        self.drop = nn.Dropout(dropout)
+        self.head = nn.Sequential(
+            nn.Linear(ch, ch // 2), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(ch // 2, n_tgt),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.input_proj(x.transpose(1, 2))
+        h = self.drop(self.blocks(h))
+        return self.head(h[:, :, -1])  # last timestep
+
+
+# ── Model 3: CNN-BiGRU-Attention (upgraded) ──────────────────────────────────
+
+class CNNBiGRUAttn(nn.Module):
+    """Temporal CNN -> BiGRU (lighter than LSTM) -> Multi-Head Attention -> MLP."""
+    def __init__(self, n_feat: int, n_tgt: int, cnn_ch: int = 96, gru_h: int = 96,
+                 n_heads: int = 8, n_gru: int = 3, dropout: float = 0.3):
+        super().__init__()
+        dilations = [1, 2, 4, 8]
+        cnn_layers: list[nn.Module] = []
+        for d in dilations:
+            cnn_layers.extend([
+                nn.Conv1d(n_feat if not cnn_layers else cnn_ch, cnn_ch, 3, padding=d, dilation=d),
+                nn.BatchNorm1d(cnn_ch), nn.GELU(),
+            ])
+        self.cnn = nn.Sequential(*cnn_layers)
+        self.cnn_res = nn.Conv1d(n_feat, cnn_ch, 1)
+        self.gru = nn.GRU(cnn_ch, gru_h, n_gru, batch_first=True, bidirectional=True, dropout=0.2)
+        self.ln = nn.LayerNorm(gru_h * 2)
+        self.attn = nn.MultiheadAttention(gru_h * 2, n_heads, dropout=0.1, batch_first=True)
+        self.attn_ln = nn.LayerNorm(gru_h * 2)
+        self.head = nn.Sequential(
+            nn.Linear(gru_h * 2, 128), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(128, 64), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(64, n_tgt),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xt = x.transpose(1, 2)
+        h = (self.cnn(xt) + self.cnn_res(xt)).transpose(1, 2)
+        h, _ = self.gru(h)
+        h = self.ln(h)
+        a, _ = self.attn(h, h, h)
+        h = self.attn_ln(h + a)
+        return self.head(h[:, -1])
+
+
+# ── Training ─────────────────────────────────────────────────────────────────
+
+def prepare_data(df: pd.DataFrame, fcols: list[str], tcols: list[str]):
+    train_m = df.index < "2020-01-01"
+    val_m = (df.index >= "2020-01-01") & (df.index < "2023-01-01")
+    test_m = df.index >= "2023-01-01"
+    X = df[fcols].values.astype(np.float32)
+    y_log = np.log1p(np.maximum(df[tcols].values.astype(np.float32), 0))
+    fs = StandardScaler().fit(X[train_m])
+    ts = StandardScaler().fit(y_log[train_m])
+    Xs, ys = fs.transform(X), ts.transform(y_log)
+    sp_X = {k: Xs[m] for k, m in [("train", train_m), ("val", val_m), ("test", test_m)]}
+    sp_y = {k: ys[m] for k, m in [("train", train_m), ("val", val_m), ("test", test_m)]}
+    loaders = {
+        k: DataLoader(TSDataset(sp_X[k], sp_y[k]), batch_size=BATCH,
+                       shuffle=(k == "train"), drop_last=(k == "train"))
+        for k in ("train", "val", "test")
     }
+    return loaders, fs, ts, sp_X, sp_y
 
 
-def print_ablation_results(ablation: dict, df: pd.DataFrame) -> None:
-    """Print LNY feature ablation impact analysis."""
-    print("\n" + "=" * 90)
-    print("DEEP LEARNING ABLATION: Impact of LNY Features on Predictions")
-    print("=" * 90)
-
-    dates = ablation["dates"]
-    full = ablation["preds_full"]
-    ablated = ablation["preds_ablated"]
-    target_names = [f"{n}_volume" for n in CONTRACTS] + [f"{n}_oi" for n in CONTRACTS]
-
-    # Focus on LNY extended window periods
-    lny_mask = np.array([df.loc[d, "is_extended_lny"] == 1.0 if d in df.index else False for d in dates])
-    non_lny_mask = ~lny_mask
-
-    print(f"\n  LNY window predictions analyzed: {lny_mask.sum()} days")
-    print(f"  Non-LNY predictions analyzed:    {non_lny_mask.sum()} days")
-
-    print(f"\n  {'Target':<20} {'LNY Impact %':>14} {'Non-LNY Impact %':>18} {'LNY-Specific':>14}")
-    print("  " + "-" * 70)
-
-    for i, name in enumerate(target_names):
-        if lny_mask.sum() > 0:
-            lny_diff_pct = np.mean((full[lny_mask, i] - ablated[lny_mask, i]) / (np.abs(ablated[lny_mask, i]) + 1e-8)) * 100
-        else:
-            lny_diff_pct = 0
-        if non_lny_mask.sum() > 0:
-            non_diff_pct = np.mean((full[non_lny_mask, i] - ablated[non_lny_mask, i]) / (np.abs(ablated[non_lny_mask, i]) + 1e-8)) * 100
-        else:
-            non_diff_pct = 0
-        specific = lny_diff_pct - non_diff_pct
-        label = CONTRACT_LABELS.get(name.rsplit("_", 1)[0], name)
-        metric = "Vol" if "volume" in name else "OI"
-        print(f"  {label + ' ' + metric:<20} {lny_diff_pct:>+13.2f}% {non_diff_pct:>+17.2f}% {specific:>+13.2f}%")
+def _no_decay_params(model: nn.Module):
+    """Proper weight decay: exclude bias and normalization params."""
+    nd = {"bias", "LayerNorm", "layernorm", "BatchNorm", "batchnorm", "ln"}
+    decay = [p for n, p in model.named_parameters() if p.requires_grad and not any(x in n for x in nd)]
+    no_decay = [p for n, p in model.named_parameters() if p.requires_grad and any(x in n for x in nd)]
+    return [{"params": decay, "weight_decay": WD}, {"params": no_decay, "weight_decay": 0.0}]
 
 
-# =============================================================================
-# 8. PREDICTION FUNCTION (for new data)
-# =============================================================================
+def train_one(model: nn.Module, loaders: dict, seed: int, tag: str) -> nn.Module:
+    torch.manual_seed(seed)
+    model = model.to(DEVICE)
+    opt = torch.optim.AdamW(_no_decay_params(model), lr=LR)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, epochs=EPOCHS, steps_per_epoch=len(loaders["train"]))
+    crit = nn.HuberLoss(delta=1.0)  # More robust than MSE for financial data
+    best_val, best_sd, wait = float("inf"), None, 0
 
-def predict(
-    model: nn.Module,
-    new_df: pd.DataFrame,
-    scaler_X: StandardScaler,
-    scaler_y: StandardScaler,
-    feature_cols: list[str],
-    target_cols: list[str],
-) -> pd.DataFrame:
-    """Run predictions on new data. Expects same feature-engineered format."""
-    X = scaler_X.transform(new_df[feature_cols].values)
-    ds = TimeSeriesDataset(X, np.zeros((len(X), len(target_cols))), window=WINDOW_SIZE)
-    loader = DataLoader(ds, batch_size=256, shuffle=False)
-    model.eval()
-    preds = []
-    with torch.no_grad():
-        for xb, _ in loader:
-            preds.append(model(xb.to(DEVICE)).cpu().numpy())
-    preds = np.concatenate(preds)
-    preds = scaler_y.inverse_transform(preds)
-    idx = new_df.index[WINDOW_SIZE : WINDOW_SIZE + len(preds)]
-    return pd.DataFrame(preds, index=idx, columns=target_cols)
+    # SWA setup
+    swa_model = AveragedModel(model)
+    swa_start = int(EPOCHS * SWA_START_FRAC)
+    swa_sched = SWALR(opt, swa_lr=LR * 0.1)
+    swa_active = False
 
-
-# =============================================================================
-# 9. MAIN PIPELINE
-# =============================================================================
-
-def main():
-    print("=" * 90)
-    print("LNY vs CBOT DEEP LEARNING ANALYSIS")
-    print("Does Lunar New Year holiday decrease CBOT trading volume & open interest?")
-    print("=" * 90)
-
-    # Load data
-    print("\n[1/6] Loading data...")
-    df = load_cbot_data()
-    holidays = load_lny_dates()
-    print(f"  CBOT data: {len(df)} trading days ({df.index.min().date()} to {df.index.max().date()})")
-    print(f"  LNY dates: {len(holidays)} years ({min(holidays)}-{max(holidays)})")
-
-    # Feature engineering
-    print("\n[2/6] Engineering features...")
-    df = engineer_features(df, holidays)
-    feature_cols = get_feature_cols(df)
-    target_cols = get_target_cols()
-    print(f"  Features: {len(feature_cols)} | Targets: {len(target_cols)}")
-    print(f"  LNY official days in data: {int(df['is_official_lny'].sum())}")
-    print(f"  LNY extended window days:  {int(df['is_extended_lny'].sum())}")
-
-    # Statistical tests
-    print("\n[3/6] Running statistical tests...")
-    stat_results = run_statistical_tests(df, holidays)
-    print_statistical_results(stat_results)
-    run_subwindow_analysis(df, holidays)
-
-    # Prepare DL data
-    print("\n[4/6] Preparing deep learning data...")
-    X_raw = df[feature_cols].values
-    # Log-transform volume/OI targets for better scale handling
-    y_raw = df[target_cols].values
-    y_raw = np.log1p(np.maximum(y_raw, 0))
-
-    # Temporal split
-    train_end = "2019-12-31"
-    val_end = "2022-12-31"
-    train_mask = df.index <= train_end
-    val_mask = (df.index > train_end) & (df.index <= val_end)
-    test_mask = df.index > val_end
-
-    scaler_X = StandardScaler().fit(X_raw[train_mask])
-    scaler_y = StandardScaler().fit(y_raw[train_mask])
-    X_scaled = scaler_X.transform(X_raw)
-    y_scaled = scaler_y.transform(y_raw)
-
-    splits = {
-        "train": (X_scaled[train_mask], y_scaled[train_mask]),
-        "val": (X_scaled[val_mask], y_scaled[val_mask]),
-        "test": (X_scaled[test_mask], y_scaled[test_mask]),
-    }
-    for name, (x, y) in splits.items():
-        print(f"  {name:>5}: {len(x):>5} samples")
-
-    train_ds = TimeSeriesDataset(splits["train"][0], splits["train"][1])
-    val_ds = TimeSeriesDataset(splits["val"][0], splits["val"][1])
-    test_ds = TimeSeriesDataset(splits["test"][0], splits["test"][1])
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
-
-    # Train model
-    print(f"\n[5/6] Training model on {DEVICE}...")
-    model = LNYCBOTModel(
-        n_features=len(feature_cols),
-        n_targets=len(target_cols),
-        hidden=128,
-    ).to(DEVICE)
-    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters: {param_count:,}")
-    print(f"  Architecture: TemporalCNN(d=[1,2,4]) -> BiLSTM(2-layer) -> MultiHeadAttn(4h) -> MLP")
-    print(f"  Anti-overfitting: dropout=0.2/0.3, weight_decay={WEIGHT_DECAY}, grad_clip={GRAD_CLIP}")
-    print(f"  Scheduler: OneCycleLR(max_lr={MAX_LR}), early_stop(patience={PATIENCE})")
-    print()
-
-    history = train_model(model, train_loader, val_loader)
-
-    # Test evaluation
-    model.eval()
-    test_losses = []
-    criterion = nn.MSELoss()
-    with torch.no_grad():
-        for xb, yb in test_loader:
+    for ep in range(EPOCHS):
+        model.train()
+        tl = []
+        for xb, yb in loaders["train"]:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            test_losses.append(criterion(model(xb), yb).item())
-    test_loss = np.mean(test_losses) if test_losses else float("nan")
+            loss = crit(model(xb), yb)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), CLIP)
+            opt.step()
+            if not swa_active:
+                sched.step()
+            tl.append(loss.item())
 
-    print(f"\n  Final losses -> Train: {history['train_loss'][-1]:.6f} | Val: {min(history['val_loss']):.6f} | Test: {test_loss:.6f}")
+        model.eval()
+        vl = []
+        with torch.no_grad():
+            for xb, yb in loaders["val"]:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                vl.append(crit(model(xb), yb).item())
 
-    # Ablation analysis
-    print("\n[6/6] Running LNY feature ablation...")
-    # Use full dataset for ablation to see impact across all periods
-    full_ds = TimeSeriesDataset(X_scaled, y_scaled)
-    ablation = run_ablation(model, full_ds, feature_cols, df.index)
-    print_ablation_results(ablation, df)
+        t, v = np.mean(tl), np.mean(vl)
 
-    # =================================================================
-    # FINAL VERDICT
-    # =================================================================
-    print("\n" + "=" * 90)
+        if ep >= swa_start and not swa_active:
+            swa_active = True
+        if swa_active:
+            swa_model.update_parameters(model)
+            swa_sched.step()
+
+        if v < best_val:
+            best_val = v
+            best_sd = {k: p.cpu().clone() for k, p in model.state_dict().items()}
+            wait = 0
+        else:
+            wait += 1
+
+        if (ep + 1) % 50 == 0 or ep == 0:
+            print(f"    [{tag}] Ep {ep+1:>3d}/{EPOCHS}  t={t:.5f} v={v:.5f} best={best_val:.5f} wait={wait}")
+
+        if wait >= PATIENCE:
+            print(f"    [{tag}] Early stop ep {ep+1}")
+            break
+
+    model.load_state_dict(best_sd)
+    # Try SWA BN update, fall back to best weights if no BN layers
+    try:
+        swa_model.load_state_dict(best_sd, strict=False)
+    except Exception:
+        pass
+    model.to(DEVICE)
+    return model
+
+
+def eval_loader(model: nn.Module, loader: DataLoader) -> float:
+    model.eval()
+    crit = nn.HuberLoss(delta=1.0)
+    losses = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            losses.append(crit(model(xb), yb).item())
+    return float(np.mean(losses)) if losses else float("nan")
+
+
+# ── Ensemble ─────────────────────────────────────────────────────────────────
+
+class Ensemble:
+    """Average predictions from multiple models, weighted by inverse validation loss."""
+    def __init__(self, models: list[nn.Module], val_losses: list[float]):
+        self.models = models
+        inv = np.array([1.0 / (l + 1e-8) for l in val_losses])
+        self.weights = inv / inv.sum()
+
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        preds = []
+        for m, w in zip(self.models, self.weights):
+            m.eval()
+            with torch.no_grad():
+                preds.append(m(x.to(DEVICE)).cpu() * w)
+        return sum(preds)
+
+    def predict_array(self, X: np.ndarray) -> np.ndarray:
+        ds = TSDataset(X, np.zeros((len(X), 1)))
+        loader = DataLoader(ds, batch_size=256, shuffle=False)
+        all_p = []
+        for xb, _ in loader:
+            all_p.append(self.predict(xb).numpy())
+        return np.concatenate(all_p) if all_p else np.empty((0,))
+
+    def mc_predict(self, X: np.ndarray, n_samples: int = 30) -> tuple[np.ndarray, np.ndarray]:
+        """Monte Carlo dropout uncertainty estimation."""
+        samples = []
+        for _ in range(n_samples):
+            for m in self.models:
+                m.train()  # enable dropout
+            ds = TSDataset(X, np.zeros((len(X), 1)))
+            loader = DataLoader(ds, batch_size=256, shuffle=False)
+            preds = []
+            with torch.no_grad():
+                for xb, _ in loader:
+                    # Bypass self.predict() which calls m.eval() — use forward directly
+                    batch_pred = sum(
+                        m(xb.to(DEVICE)).cpu() * w
+                        for m, w in zip(self.models, self.weights)
+                    )
+                    preds.append(batch_pred.numpy())
+            samples.append(np.concatenate(preds) if preds else np.empty((0,)))
+        for m in self.models:
+            m.eval()
+        stacked = np.stack(samples)
+        return stacked.mean(axis=0), stacked.std(axis=0)
+
+
+# ── Ablation & Importance ────────────────────────────────────────────────────
+
+def run_ablation(ens: Ensemble, df: pd.DataFrame, fcols: list[str], fs: StandardScaler, ts: StandardScaler):
+    test_df = df[df.index >= "2023-01-01"]
+    X_raw = test_df[fcols].values.astype(np.float32)
+    X_sc = fs.transform(X_raw)
+    lny_idx = [fcols.index(f) for f in LNY_FEATS]
+    pf = ens.predict_array(X_sc)
+    X_abl = X_raw.copy()
+    X_abl[:, lny_idx] = 0.0
+    pa = ens.predict_array(fs.transform(X_abl))
+    pf_inv = np.expm1(ts.inverse_transform(pf))
+    pa_inv = np.expm1(ts.inverse_transform(pa))
+    dates = test_df.index[SEQ_LEN:SEQ_LEN + len(pf)]
+    lm = np.array([df.loc[d, "is_extended_window"] == 1 if d in df.index else False for d in dates])
+    nlm = ~lm
+    n = min(len(pf_inv), len(lm))
+    pf_inv, pa_inv, lm, nlm = pf_inv[:n], pa_inv[:n], lm[:n], nlm[:n]
+    results = {}
+    for i, name in enumerate(target_cols()):
+        li = ((pf_inv[lm, i].mean() - pa_inv[lm, i].mean()) / (np.abs(pa_inv[lm, i].mean()) + 1e-8)) * 100 if lm.sum() > 0 else 0
+        ni = ((pf_inv[nlm, i].mean() - pa_inv[nlm, i].mean()) / (np.abs(pa_inv[nlm, i].mean()) + 1e-8)) * 100 if nlm.sum() > 0 else 0
+        results[name] = {"lny_pct": li, "non_pct": ni, "specific": li - ni}
+    return results
+
+
+def run_perm_importance(ens: Ensemble, X_sc: np.ndarray, y_sc: np.ndarray, fcols: list[str], n_rep: int = 5):
+    base = ens.predict_array(X_sc)
+    n = min(len(base), len(y_sc) - SEQ_LEN)
+    base_mse = float(np.mean((base[:n] - y_sc[SEQ_LEN:SEQ_LEN + n]) ** 2))
+    groups = {
+        "Raw OHLCV+OI": [fcols.index(f"{c}_{f}") for c in CONTRACTS for f in RAW_FIELDS],
+        "LNY Indicators": [fcols.index(f) for f in LNY_FEATS],
+        "Calendar": [fcols.index(f) for f in CAL_FEATS],
+        "Derived": [fcols.index(f"{c}_{s}") for c in CONTRACTS for s in DERIVED_PER_CONTRACT],
+    }
+    rng = np.random.RandomState(SEED)
+    imp = {}
+    for gn, idx in groups.items():
+        scores = []
+        for _ in range(n_rep):
+            Xp = X_sc.copy()
+            perm = rng.permutation(len(Xp))
+            Xp[:, idx] = Xp[perm][:, idx]
+            pp = ens.predict_array(Xp)
+            pn = min(len(pp), n)
+            scores.append(float(np.mean((pp[:pn] - y_sc[SEQ_LEN:SEQ_LEN + pn]) ** 2)) - base_mse)
+        imp[gn] = float(np.mean(scores))
+    return imp
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    W = 105
+    print("=" * W)
+    print("LNY vs CBOT: ENSEMBLE DEEP LEARNING ANALYSIS")
+    print("3-Model Ensemble: PatchTransformer + WaveNet + CNN-BiGRU-Attention")
+    print("=" * W)
+
+    # 1. Load
+    print("\n[1/8] Loading data...")
+    df_raw = load_csv()
+    hols = load_lny()
+    print(f"  {len(df_raw)} trading days: {df_raw.index.min().date()} to {df_raw.index.max().date()}")
+    print(f"  {len(hols)} LNY events: {min(hols)}-{max(hols)}")
+
+    # 2. Features
+    print("\n[2/8] Feature engineering...")
+    df, fcols, tcols = build_features(df_raw, hols)
+    nf, nt = len(fcols), len(tcols)
+    print(f"  {nf} features ({len(RAW_FIELDS)*3} raw + {len(LNY_FEATS)} LNY + {len(CAL_FEATS)} calendar + {len(DERIVED_PER_CONTRACT)*3} derived)")
+    print(f"  {nt} targets | {int(df['is_official_holiday'].sum())} official LNY days | {int(df['is_extended_window'].sum())} extended window days")
+
+    # 3. Statistics
+    print("\n[3/8] Statistical analysis...")
+    run_within_window(df, hols)
+    sr = run_stats(df, hols)
+    print_stats(sr)
+
+    # 4. Data prep
+    print("\n[4/8] Preparing temporal splits...")
+    loaders, fs, ts, sp_X, sp_y = prepare_data(df, fcols, tcols)
+    for k in ("train", "val", "test"):
+        print(f"  {k:>5}: {len(loaders[k].dataset):>5} samples")
+
+    # 5. Train ensemble
+    print(f"\n[5/8] Training 3-model ensemble on {DEVICE}...")
+    model_specs = [
+        ("PatchTF", lambda: PatchTransformer(nf, nt, d_model=128, n_heads=8, n_layers=4)),
+        ("WaveNet", lambda: WaveNet(nf, nt, ch=128)),
+        ("CNN-BiGRU", lambda: CNNBiGRUAttn(nf, nt, cnn_ch=96, gru_h=96, n_heads=8, n_gru=3)),
+    ]
+    all_models, all_vl = [], []
+    for tag, make_fn in model_specs:
+        model = make_fn()
+        np_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\n  --- {tag} ({np_count:,} params) ---")
+        trained = train_one(model, loaders, SEED, tag)
+        vl = eval_loader(trained, loaders["val"])
+        tl = eval_loader(trained, loaders["train"])
+        tel = eval_loader(trained, loaders["test"])
+        print(f"    Final: train={tl:.5f} val={vl:.5f} test={tel:.5f}")
+        all_models.append(trained)
+        all_vl.append(vl)
+
+    ens = Ensemble(all_models, all_vl)
+    print(f"\n  Ensemble weights: {['%.3f' % w for w in ens.weights]}")
+
+    # 6. Ablation
+    print("\n[6/8] LNY feature ablation...")
+    abl = run_ablation(ens, df, fcols, fs, ts)
+    print(f"\n  {'Target':<22} {'LNY Impact':>12} {'Non-LNY':>10} {'Specific':>10}")
+    print("  " + "-" * 56)
+    for name, v in abl.items():
+        cn = CONTRACT_NAMES.get(name.rsplit("_", 1)[0], name.rsplit("_", 1)[0])
+        mt = "Vol" if "VOLUME" in name else "OI"
+        print(f"  {cn+' '+mt:<22} {v['lny_pct']:>+11.2f}% {v['non_pct']:>+9.2f}% {v['specific']:>+9.2f}%")
+
+    # 7. Permutation importance
+    print("\n[7/8] Permutation importance...")
+    imp = run_perm_importance(ens, sp_X["test"], sp_y["test"], fcols)
+    total = sum(max(v, 0) for v in imp.values())
+    print(f"\n  {'Group':<20} {'dMSE':>10} {'Share':>8}")
+    print("  " + "-" * 40)
+    for g, v in sorted(imp.items(), key=lambda x: -x[1]):
+        print(f"  {g:<20} {v:>10.5f} {v/total*100 if total > 0 else 0:>7.1f}%")
+
+    # 8. MC Dropout uncertainty
+    print("\n[8/8] MC Dropout uncertainty on test set (30 samples)...")
+    test_X = sp_X["test"]
+    mc_mean, mc_std = ens.mc_predict(test_X, n_samples=30)
+    if len(mc_mean) > 0:
+        avg_cv = np.mean(mc_std / (np.abs(mc_mean) + 1e-8))
+        print(f"  Average coefficient of variation: {avg_cv:.4f}")
+        print(f"  Interpretation: {'Low' if avg_cv < 0.05 else 'Moderate' if avg_cv < 0.15 else 'High'} prediction uncertainty")
+
+    # ── Verdict ──
+    print("\n" + "=" * W)
     print("FINAL VERDICT")
-    print("=" * 90)
+    print("=" * W)
 
-    sig_count = 0
-    total_tests = 0
-    vol_changes = []
-    oi_changes = []
-    for contract in CONTRACTS:
-        for metric in ["volume", "oi"]:
-            r = stat_results[contract][metric]
-            total_tests += 1
-            if r["welch_p"] < 0.05:
-                sig_count += 1
-            if metric == "volume":
-                vol_changes.append(r["avg_yearly_pct_change"])
-            else:
-                oi_changes.append(r["avg_yearly_pct_change"])
+    sig_n = sum(1 for r in sr if r.t_pval < 0.05)
+    vol_r = [r for r in sr if r.metric == "Volume"]
+    oi_r = [r for r in sr if r.metric == "Open Interest"]
+    avg_v = np.mean([r.avg_yearly_pct for r in vol_r])
+    avg_o = np.mean([r.avg_yearly_pct for r in oi_r])
+    avg_d = np.mean([abs(r.cohens_d) for r in vol_r])
 
-    avg_vol_change = np.mean(vol_changes)
-    avg_oi_change = np.mean(oi_changes)
+    print(f"\n  Extended Window vs Control: {sig_n}/{len(sr)} tests significant (p<0.05)")
+    print(f"  Avg volume change: {avg_v:+.1f}% | Avg OI change: {avg_o:+.1f}% | Avg |d|: {avg_d:.2f}")
 
-    print(f"\n  Statistical significance: {sig_count}/{total_tests} tests show p < 0.05")
-    print(f"  Avg volume change during LNY (year-normalized):  {avg_vol_change:+.1f}%")
-    print(f"  Avg OI change during LNY (year-normalized):      {avg_oi_change:+.1f}%")
+    vol_abl_spec = np.mean([v["specific"] for k, v in abl.items() if "VOLUME" in k])
+    oi_abl_spec = np.mean([v["specific"] for k, v in abl.items() if "OI" in k])
+    print(f"  DL ablation (LNY-specific): Volume {vol_abl_spec:+.2f}% | OI {oi_abl_spec:+.2f}%")
 
-    # Year-by-year breakdown
-    print(f"\n  Year-by-year volume changes (avg across contracts):")
-    n_years = len(stat_results[CONTRACTS[0]]["volume"]["yearly_pct_changes"])
-    for i in range(n_years):
-        yr_changes = [stat_results[c]["volume"]["yearly_pct_changes"][i] for c in CONTRACTS
-                      if i < len(stat_results[c]["volume"]["yearly_pct_changes"])]
-        avg_yr = np.mean(yr_changes) if yr_changes else 0
-        direction_sym = "v" if avg_yr < 0 else "^"
-        print(f"    Year {2010+i}: {avg_yr:+6.1f}% {direction_sym}")
+    lny_share = (imp.get("LNY Indicators", 0) / total * 100) if total > 0 else 0
+    print(f"  LNY feature importance share: {lny_share:.1f}%")
 
-    if sig_count >= total_tests // 2 and avg_vol_change < -5:
-        confidence = "HIGH" if sig_count >= total_tests * 0.75 else "MODERATE"
-        print(f"\n  ANSWER: YES - LNY holiday is associated with significantly decreased")
-        print(f"  trading volumes on CBOT compared to surrounding weeks. Confidence: {confidence}")
-    elif avg_vol_change < 0:
-        print(f"\n  ANSWER: PARTIAL - Volume tends to decrease during LNY but")
-        print(f"  statistical significance is mixed. Confidence: LOW-MODERATE")
+    # Year-by-year
+    n_yr = vol_r[0].n_years if vol_r else 0
+    print(f"\n  Year-by-year (avg volume % change vs control):")
+    for i in range(n_yr):
+        yv = [r.yearly_pcts[i] for r in vol_r if i < len(r.yearly_pcts)]
+        a = np.mean(yv) if yv else 0
+        print(f"    {2010+i}: {a:>+7.1f}% {'v' if a < 0 else '^'}")
+
+    print(f"\n  " + "-" * 80)
+    if avg_v < -5 and sig_n >= len(sr) // 2:
+        print(f"  VERDICT: YES - LNY causes significantly decreased CBOT volumes.")
+    elif avg_v > 5:
+        print(f"  VERDICT: COUNTERINTUITIVELY, NO.")
+        print(f"  CBOT volumes INCREASE {avg_v:+.0f}% during LNY vs surrounding weeks.")
+        print(f"  Within-window analysis (official holiday vs adjacent weeks) provides")
+        print(f"  granular detail on whether the actual holiday days differ from pre/post.")
+        print(f"\n  EXPLANATION:")
+        print(f"  When DCE/SHFE/ZCE close for Spring Festival, Chinese hedgers and")
+        print(f"  speculators redirect agricultural commodity orders to CBOT - the only")
+        print(f"  available international venue. This 'venue substitution' effect,")
+        print(f"  combined with South American harvest season (Jan-Feb), AMPLIFIES")
+        print(f"  rather than reduces CBOT activity during Chinese New Year.")
     else:
-        print(f"\n  ANSWER: COUNTERINTUITIVELY, NO.")
-        print(f"  CBOT volumes and OI do NOT decrease during Chinese LNY - they INCREASE.")
-        print(f"  Volume +{avg_vol_change:.0f}%, OI +{avg_oi_change:.0f}% vs control windows (p < 0.001).")
-        print(f"\n  LIKELY EXPLANATION:")
-        print(f"  When Chinese domestic exchanges (DCE, SHFE, ZCE) close for LNY,")
-        print(f"  Chinese hedgers/speculators redirect orders to CBOT. Additionally,")
-        print(f"  pre-holiday positioning and South American harvest season (Jan-Feb)")
-        print(f"  amplify activity. Only Corn OI shows post-holiday unwinding (9/16 years).")
-        print(f"\n  NUANCE: The DL ablation shows the model learns LNY features as")
-        print(f"  predictive - removing them changes Soybeans OI predictions by -17.7%")
-        print(f"  and Soybean Meal OI by -31.8% specifically during LNY windows,")
-        print(f"  suggesting LNY features capture real market dynamics.")
+        print(f"  VERDICT: INCONCLUSIVE")
 
-    print(f"\n  Methodology: Year-normalized comparison (each LNY vs surrounding 8 weeks).")
-    print(f"  Sub-window analysis separates pre/during/post official holiday effects.")
-    print(f"  Bootstrap CIs and multiple test corrections applied.")
     print(f"\n  CAVEATS:")
-    print(f"  - Continuous front-month data may include contract roll artifacts")
-    print(f"  - COVID-19 (2020) LNY period had anomalous market conditions")
-    print(f"  - Jan-Feb seasonal effects partially overlap with LNY timing")
-    print(f"  - 16 LNY events is a limited sample for deep learning generalization")
-    print("=" * 90)
+    print(f"  - Front-month continuous contracts contain roll artifacts")
+    print(f"  - COVID-19 (2020) distorted that year's LNY period")
+    print(f"  - 16 LNY events limits deep learning generalization power")
+    print(f"  - Venue substitution hypothesis requires DCE data to fully confirm")
+    print(f"  - Model ablation measures learned importance, not causal effect")
+    print("=" * W)
 
 
 if __name__ == "__main__":

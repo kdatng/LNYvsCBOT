@@ -481,6 +481,34 @@ def mc_predict(model, x, n_samples=50):
     return preds.mean(dim=0), preds.std(dim=0)  # mean prediction, uncertainty
 ```
 
+## 7.5 State Space Models (Mamba, S4)
+- S4 (Structured State Space for Sequences): Linear-time alternative to attention. Models long-range dependencies via HiPPO matrix initialization. O(n) vs O(n^2) for transformers.
+- Mamba: Selective state space model. Input-dependent selection mechanism allows the model to selectively remember/forget. Currently best-in-class for long sequences.
+- When to use: Very long sequences (1000+ steps), real-time streaming, memory-constrained inference.
+- Key hyperparams: d_state (16-64), d_conv (4), expand (2), dt_rank ("auto")
+- PyTorch snippet: Use `mamba-ssm` library or implement via `torch.nn.functional.conv1d` for S4.
+- Pitfall: Mamba library requires CUDA. For CPU-only, use S4 diagonal approximation.
+
+## 7.6 Time Series Foundation Models
+- Chronos (Amazon): Tokenizes time series into bins, uses T5 architecture. Zero-shot forecasting.
+- TimesFM (Google): Pre-trained on 100B+ timepoints. Strong zero-shot and few-shot.
+- Lag-Llama: Autoregressive LLM-based forecasting with lagged features.
+- When to use: Limited training data, need quick baseline, cross-domain transfer.
+- Pitfall: These are probabilistic models - they output distributions, not point predictions. Fine-tuning on domain data almost always improves over zero-shot.
+
+## 7.7 Kolmogorov-Arnold Networks (KAN)
+- Replace MLP's fixed activation functions with learnable B-spline activations on edges.
+- Better at learning compositional/symbolic functions with fewer parameters.
+- When to use: Small datasets where you suspect the underlying function has structured composition.
+- Pitfall: Slower than MLPs per parameter. Not yet proven superior for time series at scale. Use as regression head, not backbone.
+
+## 7.8 Causal Inference for Event Studies
+- Diff-in-Diff (DID): Compare treatment vs control group before/after event. Gold standard for policy effects.
+- Synthetic Control: Construct a "synthetic" control from weighted combination of unaffected units.
+- Regression Discontinuity: When treatment assignment depends on a threshold.
+- For LNY/holiday studies: Compare CBOT (affected by Asian traders) vs non-agricultural exchange (unaffected) around LNY.
+- Key principle: Statistical significance != causation. Need proper control group and parallel trends assumption.
+
 ---
 
 ## 8. Common Pitfalls Checklist
@@ -531,6 +559,13 @@ Need uncertainty estimates:
 
 Need fastest inference:
   -> TCN or N-HiTS (no recurrence, fully parallel).
+
+Need ultra-long context (5000+ steps):
+  -> Mamba or S4. Transformers will OOM.
+
+Have very limited domain data (<200 samples):
+  -> Fine-tune a foundation model (Chronos, TimesFM).
+  -> Or use KAN as regression head on handcrafted features.
 ```
 
 ---
