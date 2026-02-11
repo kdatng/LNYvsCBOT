@@ -1,0 +1,130 @@
+{
+  "description": "China Lunar New Year (Spring Festival) Official Holiday Dates 2012-2025",
+  "source": "Compiled from Chinese government announcements and verified calendars",
+  "notes": {
+    "holiday_structure": "Official 7-day public holiday from LNY Eve to 6th day of first lunar month",
+    "policy_changes": {
+      "2008": "Holiday extended from 3 days to 7 days",
+      "2008-2013": "Holiday began on New Year's Eve",
+      "2014": "New Year's Eve became working day (controversial)",
+      "2015+": "Weekends swapped to ensure time off on New Year's Eve"
+    },
+    "extended_impact": "Many businesses close 1-2 weeks before and after official dates"
+  },
+  "holidays": {
+    "2012": {
+      "new_year_day": "2012-01-23",
+      "zodiac": "Dragon",
+      "official_holiday_start": "2012-01-22",
+      "official_holiday_end": "2012-01-28",
+      "extended_window_start": "2012-01-16",
+      "extended_window_end": "2012-02-06"
+    },
+    "2013": {
+      "new_year_day": "2013-02-10",
+      "zodiac": "Snake",
+      "official_holiday_start": "2013-02-09",
+      "official_holiday_end": "2013-02-15",
+      "extended_window_start": "2013-02-03",
+      "extended_window_end": "2013-02-24"
+    },
+    "2014": {
+      "new_year_day": "2014-01-31",
+      "zodiac": "Horse",
+      "official_holiday_start": "2014-01-31",
+      "official_holiday_end": "2014-02-06",
+      "extended_window_start": "2014-01-24",
+      "extended_window_end": "2014-02-14"
+    },
+    "2015": {
+      "new_year_day": "2015-02-19",
+      "zodiac": "Goat",
+      "official_holiday_start": "2015-02-18",
+      "official_holiday_end": "2015-02-24",
+      "extended_window_start": "2015-02-12",
+      "extended_window_end": "2015-03-05"
+    },
+    "2016": {
+      "new_year_day": "2016-02-08",
+      "zodiac": "Monkey",
+      "official_holiday_start": "2016-02-07",
+      "official_holiday_end": "2016-02-13",
+      "extended_window_start": "2016-02-01",
+      "extended_window_end": "2016-02-21"
+    },
+    "2017": {
+      "new_year_day": "2017-01-28",
+      "zodiac": "Rooster",
+      "official_holiday_start": "2017-01-27",
+      "official_holiday_end": "2017-02-02",
+      "extended_window_start": "2017-01-21",
+      "extended_window_end": "2017-02-11"
+    },
+    "2018": {
+      "new_year_day": "2018-02-16",
+      "zodiac": "Dog",
+      "official_holiday_start": "2018-02-15",
+      "official_holiday_end": "2018-02-21",
+      "extended_window_start": "2018-02-09",
+      "extended_window_end": "2018-03-02"
+    },
+    "2019": {
+      "new_year_day": "2019-02-05",
+      "zodiac": "Pig",
+      "official_holiday_start": "2019-02-04",
+      "official_holiday_end": "2019-02-10",
+      "extended_window_start": "2019-01-29",
+      "extended_window_end": "2019-02-19"
+    },
+    "2020": {
+      "new_year_day": "2020-01-25",
+      "zodiac": "Rat",
+      "official_holiday_start": "2020-01-24",
+      "official_holiday_end": "2020-01-30",
+      "extended_window_start": "2020-01-18",
+      "extended_window_end": "2020-02-08",
+      "special_note": "COVID-19 outbreak during this period - extended closures"
+    },
+    "2021": {
+      "new_year_day": "2021-02-12",
+      "zodiac": "Ox",
+      "official_holiday_start": "2021-02-11",
+      "official_holiday_end": "2021-02-17",
+      "extended_window_start": "2021-02-05",
+      "extended_window_end": "2021-02-26"
+    },
+    "2022": {
+      "new_year_day": "2022-02-01",
+      "zodiac": "Tiger",
+      "official_holiday_start": "2022-01-31",
+      "official_holiday_end": "2022-02-06",
+      "extended_window_start": "2022-01-25",
+      "extended_window_end": "2022-02-15"
+    },
+    "2023": {
+      "new_year_day": "2023-01-22",
+      "zodiac": "Rabbit",
+      "official_holiday_start": "2023-01-21",
+      "official_holiday_end": "2023-01-27",
+      "extended_window_start": "2023-01-15",
+      "extended_window_end": "2023-02-05"
+    },
+    "2024": {
+      "new_year_day": "2024-02-10",
+      "zodiac": "Dragon",
+      "official_holiday_start": "2024-02-09",
+      "official_holiday_end": "2024-02-17",
+      "extended_window_start": "2024-02-03",
+      "extended_window_end": "2024-02-24",
+      "special_note": "8-day holiday (extended from 7 days)"
+    },
+    "2025": {
+      "new_year_day": "2025-01-29",
+      "zodiac": "Snake",
+      "official_holiday_start": "2025-01-28",
+      "official_holiday_end": "2025-02-04",
+      "extended_window_start": "2025-01-22",
+      "extended_window_end": "2025-02-12"
+    }
+  }
+}
