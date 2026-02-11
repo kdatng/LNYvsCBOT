@@ -1,5 +1,5 @@
 {
-  "description": "China Lunar New Year (Spring Festival) Official Holiday Dates 2012-2025",
+  "description": "China Lunar New Year (Spring Festival) Official Holiday Dates 2010-2025",
   "source": "Compiled from Chinese government announcements and verified calendars",
   "notes": {
     "holiday_structure": "Official 7-day public holiday from LNY Eve to 6th day of first lunar month",
@@ -12,6 +12,22 @@
     "extended_impact": "Many businesses close 1-2 weeks before and after official dates"
   },
   "holidays": {
+    "2010": {
+      "new_year_day": "2010-02-14",
+      "zodiac": "Tiger",
+      "official_holiday_start": "2010-02-13",
+      "official_holiday_end": "2010-02-19",
+      "extended_window_start": "2010-02-07",
+      "extended_window_end": "2010-02-28"
+    },
+    "2011": {
+      "new_year_day": "2011-02-03",
+      "zodiac": "Rabbit",
+      "official_holiday_start": "2011-02-02",
+      "official_holiday_end": "2011-02-08",
+      "extended_window_start": "2011-01-27",
+      "extended_window_end": "2011-02-17"
+    },
     "2012": {
       "new_year_day": "2012-01-23",
       "zodiac": "Dragon",
